@@ -22,12 +22,16 @@
 #include <sdkhooks>
 #include <tf2_respawn>
 
-#define PLUGIN_VERSION "0.1"
+#define PLUGIN_VERSION "0.2"
 
 #define TFTeam_Spectator 1
 #define TFTeam_Red 2
 #define TFTeam_Blue 3
 #define TFTeam_Boss 5
+
+#define MAX_TEAM 4
+
+#define INFINITE_RESPAWN_TIME 99999.0
 
 public Plugin myinfo = 
 {
@@ -44,15 +48,11 @@ int g_iPlayerManager;
 float g_flClientRespawnTime[MAXPLAYERS + 1];
 
 //Respawn time logic.
-float flRespawnTimeBlue;
-float flRespawnTimeRed;
-float flOldRespawnTimeBlue;
-float flOldRespawnTimeRed;
-float flOldRespawnWaveTimeRed = 0.0;
-float flOldRespawnWaveTimeBlue = 0.0;
+float g_flTeamRespawnTime[MAX_TEAM];
+float g_flOldTeamRespawnTime[MAX_TEAM];
 
 //Game's respawn convars.
-Handle g_hCvarRespawnWaveTimes;
+ConVar cvarRespawnWaveTimes;
 
 //Forwards
 Handle fOnClientRespawnTimeSet;
@@ -69,10 +69,13 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error,int err_max)
 {
 	RegPluginLibrary("tf2_respawn_time");
 	
+	//Forwards
 	fOnClientRespawnTimeSet = CreateGlobalForward("TF2_OnClientRespawnTimeSet", ET_Hook, Param_Cell, Param_FloatByRef);
 	fOnTeamRespawnTimeChanged = CreateGlobalForward("TF2_OnTeamRespawnTimeChanged", ET_Hook, Param_Cell, Param_FloatByRef);
 	fOnClientRespawnTimeUpdated = CreateGlobalForward("TF2_OnClientRespawnTimeUpdated", ET_Hook, Param_Cell, Param_FloatByRef);
 	
+	//Natives
+	CreateNative("TF2_IsClientRespawning", Native_IsClientRespawning);
 	CreateNative("TF2_GetTeamRespawnTime", Native_GetTeamRespawnTime);
 	CreateNative("TF2_GetClientRespawnTime", Native_GetClientRespawnTime);
 	CreateNative("TF2_SetClientRespawnTime", Native_SetClientRespawnTime);
@@ -90,10 +93,11 @@ public void OnPluginStart()
 	HookEvent("player_spawn", Event_PlayerSpawn);
 	
 	//Game's cvars.
-	g_hCvarRespawnWaveTimes = FindConVar("mp_respawnwavetime");
+	cvarRespawnWaveTimes = FindConVar("mp_respawnwavetime");
+	HookConVarChange(cvarRespawnWaveTimes, Cvar_RespawnWaveTimeChange);
 	
 	//Start the respawn time logic.
-	CreateTimer(1.0, Timer_UpdateRespawnTimes, _, TIMER_REPEAT);
+	CreateTimer(1.0, Timer_AverageUpdateRespawnTime, _, TIMER_REPEAT);
 	
 	CreateConVar("tf2_respawn_api", PLUGIN_VERSION, "[TF2] Respawn System API!", FCVAR_SPONLY|FCVAR_REPLICATED|FCVAR_NOTIFY|FCVAR_DONTRECORD);
 }
@@ -102,6 +106,23 @@ public void OnMapStart()
 {
 	//Find the tf_player_manager entity.
 	g_iPlayerManager = GetPlayerResourceEntity();
+	
+	//Get the default respawn time
+	g_flTeamRespawnTime[TFTeam_Blue] = GameRules_GetPropFloat("m_TeamRespawnWaveTimes", TFTeam_Blue);
+	g_flTeamRespawnTime[TFTeam_Red] = GameRules_GetPropFloat("m_TeamRespawnWaveTimes", TFTeam_Red);
+	
+	if (g_flTeamRespawnTime[TFTeam_Blue] >= INFINITE_RESPAWN_TIME) g_flTeamRespawnTime[TFTeam_Blue] = 10.0;
+	if (g_flTeamRespawnTime[TFTeam_Red] >= INFINITE_RESPAWN_TIME) g_flTeamRespawnTime[TFTeam_Blue] = 10.0;
+	
+	g_flTeamRespawnTime[TFTeam_Blue] += cvarRespawnWaveTimes.FloatValue;
+	g_flTeamRespawnTime[TFTeam_Red] += cvarRespawnWaveTimes.FloatValue;
+	
+	g_flOldTeamRespawnTime[TFTeam_Blue] = g_flTeamRespawnTime[TFTeam_Blue];
+	g_flOldTeamRespawnTime[TFTeam_Red] = g_flTeamRespawnTime[TFTeam_Red];
+	
+	//Start our hooking logic
+	GameRules_SetPropFloat("m_TeamRespawnWaveTimes", INFINITE_RESPAWN_TIME, TFTeam_Blue);
+	GameRules_SetPropFloat("m_TeamRespawnWaveTimes", INFINITE_RESPAWN_TIME, TFTeam_Red);
 }
 
 /*
@@ -124,14 +145,14 @@ public Action Event_PlayerDeath(Handle hEvent, const char[] name, bool dontBroad
 	int iClient = GetClientOfUserId(GetEventInt(hEvent, "userid"));
 	if (GetEventInt(hEvent, "death_flags") & TF_DEATHFLAG_DEADRINGER) return;
 	//Actually respawning a spectator will result in a crash.
-	if(GetClientTeam(iClient) > 1 && !IsPlayerAlive(iClient))
+	if(GetClientTeam(iClient) > 1)
 	{
 		//Set the client's respawn time.
 		if(g_flClientRespawnTime[iClient] <= 0.0)
 		{
 			//Call our forward (TF2_OnClientRespawnTimeSet)
 			Action iAction;
-			float flRespawnTime = (GetClientTeam(iClient) == TFTeam_Blue) ? flRespawnTimeBlue : flRespawnTimeRed;
+			float flRespawnTime = g_flTeamRespawnTime[GetClientTeam(iClient)];
 			float flRespawnTime2 = flRespawnTime;
 			Call_StartForward(fOnClientRespawnTimeSet);
 			Call_PushCell(iClient);
@@ -147,84 +168,62 @@ public Action Event_PlayerDeath(Handle hEvent, const char[] name, bool dontBroad
 
 /*
 *
-* Stocks
+* Core
 *
 */
 
-public Action Timer_UpdateRespawnTimes(Handle hTimer)
+public void Cvar_RespawnWaveTimeChange(ConVar convar, const char[] oldValue, const char[] newValue)
 {
-	//Collect current team's respawn time.
-	float flRespawnTime = GameRules_GetPropFloat("m_TeamRespawnWaveTimes", TFTeam_Blue);
-	float flRespawnWaveTime = GetConVarFloat(g_hCvarRespawnWaveTimes);
+	float flOldRespawnWaveTime = StringToFloat(oldValue);
+	float flNewRespawnWaveTime = StringToFloat(newValue);
 	
-	//The game updated the value, collect the new value, and set it back to 99999 secs.
-	if(flRespawnTime < 99999.0)
-	{	
-		flRespawnTimeBlue = flRespawnTime;
-		flOldRespawnWaveTimeBlue = 0.0;
-		
-		//Call our forward (TF2_OnTeamRespawnTimeChanged)
-		Action iAction;
-		float flRespawnTimeBlue2 = flRespawnTimeBlue;
-		Call_StartForward(fOnTeamRespawnTimeChanged);
-		Call_PushCell(TFTeam_Blue);
-		Call_PushFloatRef(flRespawnTimeBlue2);
-		Call_Finish(iAction);
+	for (int iTeam = TFTeam_Red; iTeam <= TFTeam_Blue; iTeam++)
+	{
+		g_flTeamRespawnTime[iTeam] -= flOldRespawnWaveTime;
+		g_flTeamRespawnTime[iTeam] += flNewRespawnWaveTime;
+	}
+	TF2_RecalculateRespawnTime();
+}
 
-		if (iAction == Plugin_Changed) flRespawnTimeBlue = flRespawnTimeBlue2;
-		
-		//Infinite value, set it to 9998.0, so the logic keeps going.
-		if(flRespawnTimeBlue >= 99999.0) flRespawnTimeBlue = 9998.0;
-		
-		GameRules_SetPropFloat("m_TeamRespawnWaveTimes", 99999.0, TFTeam_Blue);
-	}
-	flRespawnTime = GameRules_GetPropFloat("m_TeamRespawnWaveTimes", TFTeam_Red);
-	if(flRespawnTime < 99999.0)
+public Action Timer_AverageUpdateRespawnTime(Handle hTimer)
+{
+	for (int iTeam = TFTeam_Red; iTeam <= TFTeam_Blue; iTeam++)
 	{
-		flRespawnTimeRed = flRespawnTime;
-		flOldRespawnWaveTimeRed = 0.0;
-		
-		//Call our forward (TF2_OnTeamRespawnTimeChanged)
-		Action iAction;
-		float flRespawnTimeRed2 = flRespawnTimeRed;
-		Call_StartForward(fOnTeamRespawnTimeChanged);
-		Call_PushCell(TFTeam_Red);
-		Call_PushFloatRef(flRespawnTimeRed2);
-		Call_Finish(iAction);
+		float flCurrentTeamRespawnTime = GameRules_GetPropFloat("m_TeamRespawnWaveTimes", iTeam);
+		if (flCurrentTeamRespawnTime != INFINITE_RESPAWN_TIME) //The game has updated the respawntime.
+		{
+			flCurrentTeamRespawnTime += cvarRespawnWaveTimes.FloatValue;
+			
+			//Call our forward (TF2_OnTeamRespawnTimeChanged)
+			Action iAction;
+			float flCurrentTeamRespawnTime2 = flCurrentTeamRespawnTime;
+			Call_StartForward(fOnTeamRespawnTimeChanged);
+			Call_PushCell(iTeam);
+			Call_PushFloatRef(flCurrentTeamRespawnTime2);
+			Call_Finish(iAction);
 
-		if (iAction == Plugin_Changed) flRespawnTimeRed = flRespawnTimeRed2;
+			if (iAction == Plugin_Changed) flCurrentTeamRespawnTime = flCurrentTeamRespawnTime2;
 		
-		//Infinite value, set it to 9998.0, so the logic keeps going.
-		if(flRespawnTimeRed >= 99999.0) flRespawnTimeRed = 9998.0;
-		
-		GameRules_SetPropFloat("m_TeamRespawnWaveTimes", 99999.0, TFTeam_Red);
+			g_flTeamRespawnTime[iTeam] = flCurrentTeamRespawnTime;
+			TF2_RecalculateRespawnTime();
+			GameRules_SetPropFloat("m_TeamRespawnWaveTimes", INFINITE_RESPAWN_TIME, iTeam);
+		}
 	}
-	
-	//Re-Calculate the respawn wave time for both team.
-	float flRespawnWaveTimeRed = (flRespawnWaveTime-flOldRespawnWaveTimeRed);
-	if(flRespawnWaveTimeRed != 0.0)
+}
+
+void TF2_RecalculateRespawnTime()//Re-sync respawntime of everyone on the server.
+{
+	for (int iTeam = TFTeam_Red; iTeam <= TFTeam_Blue; iTeam++)
 	{
-		flRespawnTimeRed += flRespawnWaveTimeRed;
-		flOldRespawnWaveTimeRed = GetConVarFloat(g_hCvarRespawnWaveTimes);
+		if (g_flTeamRespawnTime[iTeam] != g_flOldTeamRespawnTime[iTeam])//Global team respawn time changed.
+		{
+			//Find out by how much the new respawn time changed, and add it to actual client respawning.
+			float flDeltaRespawnTime = g_flTeamRespawnTime[iTeam]-g_flOldTeamRespawnTime[iTeam];
+			TF2_UpdateTeamRespawnEx(iTeam, flDeltaRespawnTime);
+			
+			g_flOldTeamRespawnTime[iTeam] = g_flTeamRespawnTime[iTeam];
+		}
 	}
-	float flRespawnWaveTimeBlue = (flRespawnWaveTime-flOldRespawnWaveTimeBlue);
-	if(flRespawnWaveTimeBlue != 0.0)
-	{
-		flRespawnTimeBlue += flRespawnWaveTimeBlue;
-		flOldRespawnWaveTimeBlue = GetConVarFloat(g_hCvarRespawnWaveTimes);
-	}
-	
-	//If the total respawn time is different from the old one, update the respawn time of every respawning clients of a team.
-	float flNewRespawnTime = (flRespawnTimeBlue-flOldRespawnTimeBlue);
-	if(flNewRespawnTime != 0.0)
-		TF2_UpdateTeamRespawnEx(TFTeam_Blue, flNewRespawnTime);
-	
-	flNewRespawnTime = (flRespawnTimeRed-flOldRespawnTimeRed);
-	if(flNewRespawnTime != 0.0)
-		TF2_UpdateTeamRespawnEx(TFTeam_Red, flNewRespawnTime);
-	
-	flOldRespawnTimeBlue = flRespawnTimeBlue;
-	flOldRespawnTimeRed = flRespawnTimeRed;
 }
 
 stock void TF2_SetClientRespawnTimeEx(int iClient,float flRespawnTime)
@@ -282,6 +281,14 @@ public Action OverrideRespawnHud(int iClient,int iOther)
 	{
 		//Set the desired respawn time on the Hud.
 		SetEntPropFloat(g_iPlayerManager, Prop_Send, "m_flNextRespawnTime", g_flClientRespawnTime[iClient], iClient);
+		//Destroy the hook if the client is alive.
+		if(IsPlayerAlive(iClient))
+		{
+			//Reset the desired respawn time.
+			g_flClientRespawnTime[iClient] = 0.0;
+			//Remove the hook.
+			SDKUnhook(iClient, SDKHook_SetTransmit, OverrideRespawnHud);
+		}
 		//Make the client respawn if our desired respawn time is elapsed.
 		if(g_flClientRespawnTime[iClient] < GetGameTime())
 		{
@@ -300,6 +307,15 @@ public Action OverrideRespawnHud(int iClient,int iOther)
 * Natives
 *
 */
+
+public int Native_IsClientRespawning(Handle hPlugin,int iNumParams)
+{
+	int iClient = GetNativeCell(1);
+	if(g_flClientRespawnTime[iClient] > 0.0 && !IsPlayerAlive(iClient))
+		return view_as<bool>(true);
+	return view_as<bool>(false);
+}
+
 
 public int Native_GetTeamRespawnTime(Handle hPlugin,int iNumParams)
 {
