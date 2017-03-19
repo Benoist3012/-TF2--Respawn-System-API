@@ -6,6 +6,14 @@
 //=======[NATIVES]=======
 
 /**
+ * Tells if the client is respawning.
+ *
+ * @param iClient	Client index.
+ * @return			Return true if the client is respawning.
+ */
+native bool TF2_IsClientRespawning(int iClient);
+
+/**
  * Gets the respawn time of a team.
  *
  * @param iTeam		Team number.
